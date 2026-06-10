@@ -1,0 +1,90 @@
+use serde_json::json;
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use crate::db::{new_conversation_id_in_dir, read_rows_from_db};
+use crate::protobuf::{extract_text_from_step_payload, extract_tool_update_from_step_payload};
+use crate::types::{JsonRpcNotification, StreamingState};
+
+pub fn poll_streaming_delta(
+    conversations_dir: &Path,
+    snapshot: Option<&HashSet<String>>,
+    session_id: &str,
+    state: &Arc<Mutex<StreamingState>>,
+) -> Vec<String> {
+    let (conversation_id, base_step_idx) = {
+        let mut guard = state.lock().unwrap();
+        if guard.conversation_id.is_none() {
+            if let Some(before) = snapshot {
+                guard.conversation_id = new_conversation_id_in_dir(conversations_dir, before);
+            }
+        }
+        (guard.conversation_id.clone(), guard.base_step_idx)
+    };
+
+    let Some(conversation_id) = conversation_id else {
+        return Vec::new();
+    };
+
+    let Some(rows) = read_rows_from_db(conversations_dir, &conversation_id, base_step_idx) else {
+        return Vec::new();
+    };
+
+    let mut guard = state.lock().unwrap();
+    let mut notifications = Vec::new();
+
+    for (idx, step_type, payload) in rows {
+        guard.last_step_idx = guard.last_step_idx.max(idx);
+
+        if step_type == 15 {
+            let Some(text) = extract_text_from_step_payload(&payload) else {
+                continue;
+            };
+            let written_len = guard.agent_text_lengths.get(&idx).copied().unwrap_or(0);
+            if text.len() <= written_len {
+                continue;
+            }
+            let Some(new_text) = text.get(written_len..) else {
+                continue;
+            };
+            guard.agent_text_lengths.insert(idx, text.len());
+            if !new_text.is_empty() {
+                notifications.push(
+                    serde_json::to_string(&JsonRpcNotification {
+                        jsonrpc: "2.0",
+                        method: "session/update".to_string(),
+                        params: json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": new_text },
+                            },
+                        }),
+                    })
+                    .unwrap(),
+                );
+            }
+        } else if matches!(step_type, 7 | 8 | 9 | 17 | 101 | 138)
+            && !guard.emitted_tool_steps.contains(&idx)
+        {
+            if let Some(update) = extract_tool_update_from_step_payload(idx, step_type, &payload) {
+                guard.emitted_tool_steps.insert(idx);
+                notifications.push(
+                    serde_json::to_string(&JsonRpcNotification {
+                        jsonrpc: "2.0",
+                        method: "session/update".to_string(),
+                        params: json!({
+                            "sessionId": session_id,
+                            "update": update,
+                        }),
+                    })
+                    .unwrap(),
+                );
+            }
+        }
+    }
+
+    guard.had_updates = guard.had_updates || !notifications.is_empty();
+    notifications
+}
