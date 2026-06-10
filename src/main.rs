@@ -89,6 +89,8 @@ struct Adapter {
 }
 
 impl Adapter {
+    const MODEL_CONFIG_ID: &'static str = "model";
+
     fn new() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
@@ -142,6 +144,42 @@ impl Adapter {
         json!({
             "currentModelId": current,
             "availableModels": available,
+        })
+    }
+
+    /// Build the ACP session config option that Zed uses for its model selector.
+    fn session_config_options_json(&mut self, model_id: Option<&str>) -> Value {
+        if self.available_models.is_empty() {
+            self.available_models = Self::fetch_available_models();
+        }
+        let current = model_id
+            .or_else(|| self.available_models.first().map(|s| s.as_str()))
+            .unwrap_or("");
+        let options: Vec<Value> = self
+            .available_models
+            .iter()
+            .map(|name| {
+                json!({
+                    "value": name,
+                    "name": name,
+                })
+            })
+            .collect();
+        json!([{
+            "id": Self::MODEL_CONFIG_ID,
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current,
+            "options": options,
+        }])
+    }
+
+    fn session_config_result_json(&mut self, session_id: &str, model_id: Option<&str>) -> Value {
+        json!({
+            "sessionId": session_id,
+            "models": self.session_models_json(model_id),
+            "configOptions": self.session_config_options_json(model_id),
         })
     }
 
@@ -898,11 +936,11 @@ impl Adapter {
                 model_id: None,
             },
         );
-        let models = self.session_models_json(None);
+        let result = self.session_config_result_json(&session_id, None);
         JsonRpcResponse {
             jsonrpc: "2.0",
             id,
-            result: Some(json!({ "sessionId": session_id, "models": models })),
+            result: Some(result),
             error: None,
         }
     }
@@ -978,11 +1016,11 @@ impl Adapter {
                 .sessions
                 .get(session_id)
                 .and_then(|s| s.model_id.clone());
-            let models = self.session_models_json(model_id.as_deref());
+            let result = self.session_config_result_json(session_id, model_id.as_deref());
             serde_json::to_string(&JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
-                result: Some(json!({ "sessionId": session_id, "models": models })),
+                result: Some(result),
                 error: None,
             })
             .unwrap()
@@ -1011,11 +1049,11 @@ impl Adapter {
                 .sessions
                 .get(session_id)
                 .and_then(|s| s.model_id.clone());
-            let models = self.session_models_json(model_id.as_deref());
+            let result = self.session_config_result_json(session_id, model_id.as_deref());
             return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
-                result: Some(json!({ "sessionId": session_id, "models": models })),
+                result: Some(result),
                 error: None,
             };
         }
@@ -1081,6 +1119,77 @@ impl Adapter {
             jsonrpc: "2.0",
             id,
             result: Some(json!({})),
+            error: None,
+        }
+    }
+
+    fn handle_session_set_config_option(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let config_id = params
+            .get("configId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let model_id = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+        if session_id.is_empty() || config_id.is_empty() || model_id.is_empty() {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(
+                    json!({"code":-32602,"message":"missing sessionId, configId, or value"}),
+                ),
+            };
+        }
+
+        if config_id != Self::MODEL_CONFIG_ID {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(json!({
+                    "code": -32602,
+                    "message": format!("unknown configId: {config_id}"),
+                })),
+            };
+        }
+
+        if !self.sessions.contains_key(session_id) {
+            let _ = self.restore_session_state(session_id);
+        }
+
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(json!({
+                    "code": -32000,
+                    "message": format!("unknown sessionId: {session_id}"),
+                })),
+            };
+        };
+
+        session.model_id = Some(model_id.to_string());
+        let model_id_str = session.model_id.clone();
+        let last_step_idx = session.last_step_idx;
+        let conv_id = session.conversation_id.clone();
+
+        self.persist_session(
+            session_id,
+            conv_id.as_deref(),
+            last_step_idx,
+            model_id_str.as_deref(),
+        );
+
+        let config_options = self.session_config_options_json(model_id_str.as_deref());
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(json!({ "configOptions": config_options })),
             error: None,
         }
     }
@@ -1367,6 +1476,13 @@ async fn main() {
             Some("session/set_model") | Some("session/setModel") => {
                 let params = req.params.unwrap_or(json!({}));
                 vec![serde_json::to_string(&adapter.handle_session_set_model(id, &params)).unwrap()]
+            }
+            Some("session/set_config_option") | Some("session/setConfigOption") => {
+                let params = req.params.unwrap_or(json!({}));
+                vec![
+                    serde_json::to_string(&adapter.handle_session_set_config_option(id, &params))
+                        .unwrap(),
+                ]
             }
             Some(method) => {
                 let r = JsonRpcResponse {
@@ -2778,6 +2894,13 @@ mod tests {
         let models = result.get("models").unwrap();
         assert!(models.get("currentModelId").is_some());
         assert!(models.get("availableModels").is_some());
+        let config_options = result.get("configOptions").unwrap().as_array().unwrap();
+        assert_eq!(config_options.len(), 1);
+        assert_eq!(config_options[0]["id"].as_str(), Some("model"));
+        assert_eq!(config_options[0]["category"].as_str(), Some("model"));
+        assert_eq!(config_options[0]["type"].as_str(), Some("select"));
+        assert!(config_options[0].get("currentValue").is_some());
+        assert!(config_options[0].get("options").is_some());
     }
 
     #[test]
@@ -2822,6 +2945,55 @@ mod tests {
         );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap()["code"].as_i64(), Some(-32000));
+    }
+
+    #[test]
+    fn test_session_set_config_option_sets_model() {
+        let mut adapter = Adapter::new();
+        adapter.available_models = vec!["Model A".to_string(), "Model B".to_string()];
+        let new_resp = adapter.handle_session_new(json!(1));
+        let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let set_resp = adapter.handle_session_set_config_option(
+            json!(2),
+            &json!({"sessionId": session_id, "configId": "model", "value": "Model B"}),
+        );
+
+        assert!(set_resp.error.is_none(), "error: {:?}", set_resp.error);
+        assert_eq!(
+            adapter
+                .sessions
+                .get(&session_id)
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("Model B")
+        );
+        let config_options = set_resp.result.as_ref().unwrap()["configOptions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(config_options[0]["currentValue"].as_str(), Some("Model B"));
+    }
+
+    #[test]
+    fn test_session_set_config_option_rejects_unknown_config() {
+        let mut adapter = Adapter::new();
+        let new_resp = adapter.handle_session_new(json!(1));
+        let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = adapter.handle_session_set_config_option(
+            json!(2),
+            &json!({"sessionId": session_id, "configId": "not-model", "value": "Model B"}),
+        );
+
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.as_ref().unwrap()["code"].as_i64(), Some(-32602));
     }
 
     #[test]
@@ -2902,6 +3074,10 @@ mod tests {
             models["currentModelId"].as_str(),
             Some("Gemini 3.1 Pro (High)")
         );
+        assert_eq!(
+            response["result"]["configOptions"][0]["currentValue"].as_str(),
+            Some("Gemini 3.1 Pro (High)")
+        );
     }
 
     #[test]
@@ -2923,6 +3099,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             models["currentModelId"].as_str(),
+            Some("GPT-OSS 120B (Medium)")
+        );
+        assert_eq!(
+            response.result.as_ref().unwrap()["configOptions"][0]["currentValue"].as_str(),
             Some("GPT-OSS 120B (Medium)")
         );
     }
@@ -2950,5 +3130,20 @@ mod tests {
         assert_eq!(available.len(), 2);
         assert_eq!(available[0]["modelId"].as_str(), Some("Model A"));
         assert_eq!(available[1]["modelId"].as_str(), Some("Model B"));
+    }
+
+    #[test]
+    fn test_session_config_options_json_with_model() {
+        let mut adapter = Adapter::new();
+        adapter.available_models = vec!["Model A".to_string(), "Model B".to_string()];
+        let config_options = adapter.session_config_options_json(Some("Model B"));
+        assert_eq!(config_options[0]["id"].as_str(), Some("model"));
+        assert_eq!(config_options[0]["category"].as_str(), Some("model"));
+        assert_eq!(config_options[0]["type"].as_str(), Some("select"));
+        assert_eq!(config_options[0]["currentValue"].as_str(), Some("Model B"));
+        let options = config_options[0]["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["value"].as_str(), Some("Model A"));
+        assert_eq!(options[1]["value"].as_str(), Some("Model B"));
     }
 }
